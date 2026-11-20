@@ -267,6 +267,15 @@ public:
 	                          vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                          const ShaderProgram& vertex_program, const ShaderProgram& pixel_program,
 	                          bool native_bindings);
+	// A draw's pipeline under KYTY_ASYNC_PIPELINES (DrawPipelinesAsync): as CreateGraphicsPipeline when a cache holds it;
+	// else made on a draw worker, unoptimized first like the render thread's, and null meanwhile (PipelineWaiting: the
+	// flag the caller may wait on for a few milliseconds before it leaves the draw out).
+	[[nodiscard]] Pipeline*
+	TryCreateDrawPipeline(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+	                      const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+	                      const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+	                      bool primitive_restart_enable, const ShaderProgram& vertex_program,
+	                      const ShaderProgram& pixel_program);
 	Pipeline& CreateComputePipeline(const ShaderComputeInputInfo& input_info,
 	                                const ShaderProgram&          compute_program);
 	// The last GetGraphicsPrograms or GetComputeProgram in table mode found a program a worker still translates
@@ -448,6 +457,9 @@ private:
 	// The optimized builds of pipelines in use unoptimized (BuildOptimized): background threads of their own, so a
 	// pipeline a draw waits for is never queued behind them (0.1-4 s each).
 	std::unique_ptr<CompileWorkers> m_optimize_workers;
+	// KYTY_ASYNC_PIPELINES: the draws' pipelines no cache held (TryCreateDrawPipeline), at normal priority and apart from
+	// the XPR variants' queue, which a new area fills with hundreds.
+	std::unique_ptr<CompileWorkers> m_draw_workers;
 	// Unoptimized pipelines whose optimized build is pending, and those it replaced (recorded commands
 	// may still use them).
 	std::vector<Pipeline*>    m_optimizing;
@@ -477,7 +489,8 @@ private:
 	                                     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	                                     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
 	                                     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async);
+	                                     const ShaderProgram& pixel_program, bool native_bindings, bool async,
+	                                     bool draw_async = false);
 	void      FinishCompileWorkers();
 	bool      m_session_reported = false; // (ReportSession)
 	// The start-up warmup (the constructor's choices): in front of the game, or beside it on m_warmup_thread
@@ -520,6 +533,7 @@ private:
 	CompileWorkers& Workers();
 	CompileWorkers& TableWorkers();
 	CompileWorkers& OptimizeWorkers();
+	CompileWorkers& DrawWorkers();
 	void            BuildOptimized(Pipeline& pipeline, std::function<void(Pipeline&)> build);
 	void            PromoteOptimized();
 	// At each flip: with the video memory in use near the GPU's budget, the pipelines no binding used for a while leave
@@ -591,6 +605,13 @@ bool PipelineKeyLog();
 void ReportStaticStore();
 // Whether the static store gave the last pipeline this thread made (shaders.cpp).
 bool LastPipelineFromStore();
+
+// KYTY_ASYNC_PIPELINES=1: a draw whose pipeline no cache holds does not wait for the driver's compile on the render
+// thread; it waits up to KYTY_ASYNC_PIPELINES_WAIT_MS (default 8) and is otherwise left out of that frame while a draw
+// worker makes the pipeline. Fewer freezes in new areas; meanwhile an object or effect can be missing for a moment.
+bool     DrawPipelinesAsync();
+uint32_t DrawPipelineWaitUs();
+void     NoteDrawPipelineSkipped();
 // The pipeline's handle for a binding now (the GPU thread): the flip noted, and the pipeline made again first when it was
 // evicted (PipelineCache::EvictIdlePipelines).
 vk::Pipeline BindPipelineHandle(const PipelineCache::Pipeline& pipeline);

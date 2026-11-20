@@ -2885,6 +2885,7 @@ struct PipelineCache::PendingGraphicsPipeline {
 	ShaderProgram             vertex_program;
 	ShaderProgram             pixel_program;
 	bool                      native_bindings = false;
+	bool                      draw_async      = false; // (TryCreateDrawPipeline: unoptimized first, recorded when done)
 	std::atomic<bool>         done {false};
 };
 
@@ -2970,6 +2971,47 @@ PipelineCache::CompileWorkers& PipelineCache::TableWorkers() {
 		m_table_workers = std::make_unique<CompileWorkers>(std::max(2u, std::thread::hardware_concurrency() / 2u), true);
 	}
 	return *m_table_workers;
+}
+
+PipelineCache::CompileWorkers& PipelineCache::DrawWorkers() {
+	if (m_draw_workers == nullptr) {
+		const char* value   = std::getenv("KYTY_ASYNC_PIPELINES_THREADS");
+		const auto  threads = value != nullptr && std::atoi(value) > 0 ? static_cast<uint32_t>(std::atoi(value)) : 4u;
+		m_draw_workers      = std::make_unique<CompileWorkers>(std::min(threads, 16u), false);
+	}
+	return *m_draw_workers;
+}
+
+namespace {
+std::atomic<uint64_t> g_draws_skipped {0}, g_draw_pipelines_async {0};
+} // namespace
+
+bool DrawPipelinesAsync() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_ASYNC_PIPELINES");
+		const bool  set   = value != nullptr && std::string_view(value) == "1";
+		if (set) {
+			std::printf("Async pipelines: on (KYTY_ASYNC_PIPELINES=1): a draw waits up to %.1f ms for a pipeline no cache "
+			            "holds, then is left out until a draw worker has made it\n",
+			            DrawPipelineWaitUs() / 1000.0);
+			std::fflush(stdout);
+		}
+		return set;
+	}();
+	return on;
+}
+
+uint32_t DrawPipelineWaitUs() {
+	static const uint32_t us = [] {
+		const char* value = std::getenv("KYTY_ASYNC_PIPELINES_WAIT_MS");
+		if (value == nullptr || *value == '\0') return 8000u;
+		return static_cast<uint32_t>(std::clamp(std::atof(value), 0.0, 100.0) * 1000.0);
+	}();
+	return us;
+}
+
+void NoteDrawPipelineSkipped() {
+	g_draws_skipped.fetch_add(1, std::memory_order_relaxed);
 }
 
 PipelineCache::CompileWorkers& PipelineCache::OptimizeWorkers() {
@@ -3374,6 +3416,11 @@ void PipelineCache::FinishCompileWorkers() {
 	m_optimize_workers.reset();
 	m_table_workers.reset();
 	m_compile_workers.reset();
+	m_draw_workers.reset();
+	if (g_draw_pipelines_async.load() != 0)
+		std::printf("Async pipelines: %llu made beside the game, %llu draws left out meanwhile\n",
+		            static_cast<unsigned long long>(g_draw_pipelines_async.load()),
+		            static_cast<unsigned long long>(g_draws_skipped.load()));
 	for (auto& [key, pending]: m_pending_graphics_pipelines) {
 		if (pending->done.load(std::memory_order_acquire) && pending->pipeline->pipeline != nullptr) {
 			m_graphics_pipelines.emplace(key, std::move(pending->pipeline));
@@ -4814,12 +4861,23 @@ PipelineCache::Pipeline* PipelineCache::TryCreateGraphicsPipeline(
 	                                  native_bindings, true);
 }
 
+PipelineCache::Pipeline* PipelineCache::TryCreateDrawPipeline(
+    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+    const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
+    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
+    bool primitive_restart_enable, const ShaderProgram& vertex_program,
+    const ShaderProgram& pixel_program) {
+	return CreateGraphicsPipelineImpl(colors, depth, vs_input_info, command, ps_input_info, topology,
+	                                  primitive_restart_enable, vertex_program, pixel_program,
+	                                  false, true, true);
+}
+
 PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-    const ShaderProgram& pixel_program, bool native_bindings, bool async) {
+    const ShaderProgram& pixel_program, bool native_bindings, bool async, bool draw_async) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -4976,13 +5034,38 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 				m_pipeline_waiting = std::shared_ptr<const std::atomic<bool>>(pending->second, &pending->second->done);
 				return nullptr;
 			}
-			auto finished = std::move(pending->second->pipeline);
+			const auto job      = pending->second;
+			auto       finished = std::move(job->pipeline);
 			m_pending_graphics_pipelines.erase(pending);
 			EXIT_NOT_IMPLEMENTED(finished->pipeline == nullptr || finished->pipeline_layout == nullptr);
 			auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(finished));
 			EXIT_IF(!inserted);
 			if (indexed) {
 				m_native_graphics_pipelines.emplace(iter->first, iter->second.get());
+			}
+			if (job->draw_async) {
+				// As the render thread's own (below): its optimized build, and its recipe for the next sessions' warmup.
+				std::optional<ShaderPixelInputInfo> pixel_info;
+				if (job->ps_active) pixel_info = job->ps_input_info;
+				BuildOptimized(*iter->second, [this, rendering = job->rendering, vertex_input = job->vertex_input,
+				                               vs_input_info = job->vs_input_info, pixel_info,
+				                               vertex_program = job->vertex_program, pixel_program = job->pixel_program,
+				                               static_params = job->static_params](Pipeline& target) {
+					CreatePipelineInternal(m_graphics, target, rendering, vertex_input, vs_input_info, vertex_program,
+					                       pixel_info ? &*pixel_info : nullptr, pixel_program, static_params, m_driver_cache,
+					                       false, PipelineBuild::Optimize);
+				});
+				LocalShaderWarmup::PipelineRecord recipe;
+				recipe.vertex = m_program_cache->RecordedIndex(job->vertex_program);
+				recipe.pixel  = job->ps_active ? m_program_cache->RecordedIndex(job->pixel_program) : LocalShaderWarmup::NoShader;
+				recipe.rendering    = iter->first.rendering;
+				recipe.vertex_input = iter->first.vertex_input;
+				recipe.state        = iter->first.static_params;
+				if (recipe.vertex != LocalShaderWarmup::NoShader &&
+				    (!job->ps_active || recipe.pixel != LocalShaderWarmup::NoShader)) {
+					m_program_cache->warmup.AddPipeline(recipe);
+					iter->second->recipe = LocalShaderWarmup::RecipeKey(recipe);
+				}
 			}
 			return iter->second.get();
 		}
@@ -4998,10 +5081,12 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 		if (ps_active) {
 			job->ps_input_info = *ps_input_info;
 		}
-		m_pending_graphics_pipelines.emplace(key, job);
 		const bool table = vs_input_info.stage.program != nullptr && vs_input_info.stage.program->table_mode;
+		job->draw_async  = draw_async && !table;
+		m_pending_graphics_pipelines.emplace(key, job);
 		if (table) m_table_pipeline_jobs.fetch_add(1, std::memory_order_relaxed);
-		(table ? TableWorkers() : Workers()).Push([this, job, table] {
+		if (job->draw_async) g_draw_pipelines_async.fetch_add(1, std::memory_order_relaxed);
+		(table ? TableWorkers() : job->draw_async ? DrawWorkers() : Workers()).Push([this, job, table] {
 			// (KYTY_HITCH_LOG_MS: a pipeline no cache held, compiled while its draws took another path.)
 			SlowLog::Scope slow([&](double ms) {
 				const auto* pixel = job->ps_active ? job->ps_input_info.stage.program : nullptr;
@@ -5013,7 +5098,7 @@ PipelineCache::Pipeline* PipelineCache::CreateGraphicsPipelineImpl(
 			                       job->vs_input_info, job->vertex_program,
 			                       job->ps_active ? &job->ps_input_info : nullptr, job->pixel_program,
 			                       job->static_params, table ? TablePipelineCache() : m_driver_cache,
-			                       job->native_bindings);
+			                       job->native_bindings, job->draw_async ? FirstBuild(m_graphics) : PipelineBuild::Full);
 			if (KeepsRemake(m_graphics, *job->pipeline, LastPipelineFromStore())) {
 				GraphicsMakeInputs inputs;
 				inputs.rendering       = job->rendering;

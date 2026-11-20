@@ -55,6 +55,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -63,6 +64,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1562,10 +1564,38 @@ bool RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
-	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs.vertex, state.programs.pixel);
+	auto& pipelines = m_context.GetPipelineCache();
+	// KYTY_ASYNC_PIPELINES (DrawPipelinesAsync): a pipeline no cache holds made beside the game. The draw waits a few
+	// milliseconds (one from the static store or the driver's cache is ready by then) and is otherwise left out of this
+	// frame; the next one draws it. Not in a speculative translation (recorded apart, its draws are committed as made).
+	PipelineCache::Pipeline* chosen = nullptr;
+	if (DrawPipelinesAsync() && Spec::Current() == nullptr) {
+		const auto make = [&] {
+			return pipelines.TryCreateDrawPipeline(std::span {state.color_info, state.color_count}, state.depth_info,
+			                                       state.vs_input_info, buffer, state.ps_active ? &state.ps_input_info : nullptr,
+			                                       topology, primitive_restart_enable, state.programs.vertex,
+			                                       state.programs.pixel);
+		};
+		chosen = make();
+		if (chosen == nullptr) {
+			if (const auto waiting = pipelines.PipelineWaiting(); waiting != nullptr) {
+				const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(DrawPipelineWaitUs());
+				while (!waiting->load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until)
+					std::this_thread::yield();
+				if (waiting->load(std::memory_order_acquire)) chosen = make();
+			}
+		}
+		if (chosen == nullptr) {
+			NoteDrawPipelineSkipped();
+			return true; // (left out: drawn once its pipeline is made)
+		}
+	} else {
+		chosen = &pipelines.CreateGraphicsPipeline(
+		    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
+		    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+		    state.programs.vertex, state.programs.pixel);
+	}
+	auto& pipeline = *chosen;
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
